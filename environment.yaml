@@ -1,0 +1,23 @@
+name: vision-ai
+channels:
+  - defaults
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch=2.3.1
+  - torchvision
+  - torchaudio
+  - cudatoolkit=11.8  # Remove if using CPU-only
+  - flask=3.0.3
+  - pillow=10.4.0
+  - numpy=1.26.4
+  - opencv
+  - pip:
+      - transformers==4.46.2
+      - accelerate==0.34.2
+      - sentencepiece==0.2.0
+      - safetensors==0.4.5
+      - ultralytics==8.3.24
+      - tqdm==4.66.4

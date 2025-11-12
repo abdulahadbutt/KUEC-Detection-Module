@@ -95,6 +95,7 @@ def parse_coord(text, height, width):
     points = np.array(points)
     return points
 
+
 def get_mask(image, coords):
     bboxes = []
     if len(coords) > 0:
@@ -111,6 +112,7 @@ def get_mask(image, coords):
                 else:
                     bboxes.append(None)
     return bboxes
+
 
 def detect(image_path, prompt):
     cv_img = cv2.imread(image_path)
