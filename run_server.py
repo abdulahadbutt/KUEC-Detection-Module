@@ -10,6 +10,22 @@ import time
 import xml.etree.ElementTree as ET
 
 
+def distance_to_detected_center(bounding_box, depth_map):
+    x, y, w, h = bounding_box
+    center_x = x + w // 2
+    center_y = y + h // 2
+
+    # Ensure the center coordinates are within the depth map bounds
+    center_x = min(max(center_x, 0), depth_map.shape[1] - 1)
+    center_y = min(max(center_y, 0), depth_map.shape[0] - 1)
+
+    # Get the depth value at the center of the bounding box
+    depth_value = depth_map[center_y, center_x]
+
+    print(f"Depth at detected center ({center_x}, {center_y}): {depth_value}")
+    return depth_value
+
+
 app = Flask(__name__)
 
 # Load models
@@ -116,7 +132,9 @@ def get_mask(image, coords):
 
 def detect(image_path, prompt):
     cv_img = cv2.imread(image_path)
-    cropped_cv_image, y_offset = crop_panorama(cv_img)
+    # cropped_cv_image, y_offset = crop_panorama(cv_img)
+    cropped_cv_image = cv_img
+    y_offset = 0
     cropped_cv_image_rgb = cv2.cvtColor(cropped_cv_image, cv2.COLOR_BGR2RGB)
     height, width = cropped_cv_image_rgb.shape[:2]
 
@@ -146,19 +164,32 @@ def detect_objects():
         return jsonify({"error": "Image file and prompt are required"}), 400
 
     file = request.files['file']
+    depth_map = request.files['depth']
     prompt = request.form['prompt']
     
     temp_image_path = "/tmp/temp_image.jpg"
+    temp_depth_path = "/tmp/temp_depth.png"
+
     file.save(temp_image_path)
+    depth_map.save(temp_depth_path)
+    depth_map = cv2.imread(temp_depth_path)
     
     try:
         bounding_boxes = detect(temp_image_path, prompt)
+        print(f"Detected bounding boxes: {bounding_boxes}, {depth_map.shape}")
+        distance = distance_to_detected_center(bounding_boxes[0], cv2.imread(temp_depth_path, cv2.IMREAD_UNCHANGED))
     except ValueError as e:
         return jsonify({"error": str(e)}), 500
 
     os.remove(temp_image_path)
     
-    return jsonify({"bounding_box": bounding_boxes[0]})
+    try:
+        return jsonify({"bounding_box": bounding_boxes[0], "distance": float(distance)})
+    except Exception as e:
+        print(distance, type(distance))
+        return jsonify({"error": str(e)}), 500
+
+
 
 def get_prompt(image_path, prompt):
     cv_img = cv2.imread(image_path)
