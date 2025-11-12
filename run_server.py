@@ -8,8 +8,7 @@ from ultralytics import SAM
 import os
 import time
 import xml.etree.ElementTree as ET
-
-
+import yaml 
 
 app = Flask(__name__)
 
@@ -30,20 +29,57 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 
-def distance_to_detected_center(bounding_box, depth_map):
-    x, y, w, h = bounding_box
-    center_x = x + w // 2
-    center_y = y + h // 2
 
-    # Ensure the center coordinates are within the depth map bounds
-    center_x = min(max(center_x, 0), depth_map.shape[1] - 1)
-    center_y = min(max(center_y, 0), depth_map.shape[0] - 1)
+def distance_to_detected_center(bounding_box, depth_map, mask, molmo_point=None):
+    if CONFIG['Method'] == 'Midpoint':
+        x, y, w, h = bounding_box
+        center_x = x + w // 2
+        center_y = y + h // 2
 
-    # Get the depth value at the center of the bounding box
-    depth_value = depth_map[center_y, center_x]
+        # Ensure the center coordinates are within the depth map bounds
+        center_x = min(max(center_x, 0), depth_map.shape[1] - 1)
+        center_y = min(max(center_y, 0), depth_map.shape[0] - 1)
 
-    print(f"Depth at detected center ({center_x}, {center_y}): {depth_value}")
-    return depth_value
+        # Get the depth value at the center of the bounding box
+        depth_value = depth_map[center_y, center_x]
+
+        print(f"Depth at detected center ({center_x}, {center_y}): {depth_value}")
+        return depth_value
+    
+
+    if CONFIG['Method'] == 'Average':
+        # Mask the depth map to get only the pixels within the detected object
+        masked_depth = depth_map * np.array(mask)
+
+        # Get non-zero depth values (valid depth readings)
+        valid_depths = masked_depth[masked_depth > 0]
+
+        if len(valid_depths) == 0:
+            print("No valid depth readings found within the detected object.")
+            return float('inf')  # or some indication of invalid depth
+
+        # Calculate the average depth
+        average_depth = np.mean(valid_depths)
+
+        print(f"Average depth within detected object: {average_depth}")
+        return average_depth
+    
+
+    if CONFIG['Method'] == 'Molmo':
+        if molmo_point is None:
+            raise ValueError("Molmo point coordinates are required for 'Molmo' method")
+
+        molmo_x, molmo_y = molmo_point
+
+        # Ensure the Molmo point coordinates are within the depth map bounds
+        molmo_x = min(max(molmo_x, 0), depth_map.shape[1] - 1)
+        molmo_y = min(max(molmo_y, 0), depth_map.shape[0] - 1)
+
+        # Get the depth value at the Molmo point
+        depth_value = depth_map[molmo_y, molmo_x]
+
+        print(f"Depth at Molmo point ({molmo_x}, {molmo_y}): {depth_value}")
+        return depth_value
 
 
 
@@ -240,7 +276,7 @@ def detect(image_path, prompt):
         if not ok:
             raise IOError(f"Failed to write annotated image to: {save_annotated_to}")
 
-    return adjusted_bboxes, adjusted_masks
+    return adjusted_bboxes, adjusted_masks, obj_coord
 
 # Flask route to handle object detection
 @app.route('/detect', methods=['POST'])
@@ -262,9 +298,9 @@ def detect_objects():
     depth_map.save(temp_depth_path)
 
     try:
-        bounding_boxes, masks = detect(temp_image_path, prompt)
+        bounding_boxes, masks, molmo_point = detect(temp_image_path, prompt)
         print(f"Detected bounding boxes: {bounding_boxes}")
-        distance = distance_to_detected_center(bounding_boxes[0], cv2.imread(temp_depth_path, cv2.IMREAD_UNCHANGED))
+        distance = distance_to_detected_center(bounding_boxes[0], cv2.imread(temp_depth_path, cv2.IMREAD_UNCHANGED), masks[0], molmo_point[0])
     except ValueError as e:
         return jsonify({"error": str(e)}), 500
 
@@ -278,6 +314,9 @@ def detect_objects():
 
 
 
+
+
+
 if __name__ == '__main__':
-    DEBUG = True # Set to False in production
+    CONFIG = yaml.safe_load(open('configs/base.yaml', 'r'))
     app.run(host='0.0.0.0', port=5007)
