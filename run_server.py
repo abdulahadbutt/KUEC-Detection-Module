@@ -10,21 +10,6 @@ import time
 import xml.etree.ElementTree as ET
 
 
-def distance_to_detected_center(bounding_box, depth_map):
-    x, y, w, h = bounding_box
-    center_x = x + w // 2
-    center_y = y + h // 2
-
-    # Ensure the center coordinates are within the depth map bounds
-    center_x = min(max(center_x, 0), depth_map.shape[1] - 1)
-    center_y = min(max(center_y, 0), depth_map.shape[0] - 1)
-
-    # Get the depth value at the center of the bounding box
-    depth_value = depth_map[center_y, center_x]
-
-    print(f"Depth at detected center ({center_x}, {center_y}): {depth_value}")
-    return depth_value
-
 
 app = Flask(__name__)
 
@@ -44,14 +29,28 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map='auto'
 )
 
-def crop_panorama(image):
-    height, width = image.shape[:2]
-    middle_height_start = height // 3
-    middle_height_end = (height * 2) // 3
-    middle_image = image[middle_height_start:middle_height_end, :]
-    return middle_image, middle_height_start
+
+def distance_to_detected_center(bounding_box, depth_map):
+    x, y, w, h = bounding_box
+    center_x = x + w // 2
+    center_y = y + h // 2
+
+    # Ensure the center coordinates are within the depth map bounds
+    center_x = min(max(center_x, 0), depth_map.shape[1] - 1)
+    center_y = min(max(center_y, 0), depth_map.shape[0] - 1)
+
+    # Get the depth value at the center of the bounding box
+    depth_value = depth_map[center_y, center_x]
+
+    print(f"Depth at detected center ({center_x}, {center_y}): {depth_value}")
+    return depth_value
+
+
 
 def generate_point(image, prompt):
+    '''
+    Given an image and a prompt, generate the coordinates of the object in the image.
+    '''
     with torch.no_grad():
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             inputs = processor.process(images=[image], text="Point the " + prompt)
@@ -64,6 +63,8 @@ def generate_point(image, prompt):
             generated_tokens = output[0, inputs['input_ids'].size(1):]
             generated_text = processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
     return generated_text
+
+
 
 def generate_vlm_request(image, prompt):
     
@@ -82,6 +83,7 @@ def generate_vlm_request(image, prompt):
             generated_tokens = output[0, inputs['input_ids'].size(1):]
             generated_text = processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
     return generated_text
+
 
 def parse_coord(text, height, width):
     text = text.strip()
@@ -114,6 +116,7 @@ def parse_coord(text, height, width):
 
 def get_mask(image, coords):
     bboxes = []
+    masks = []
     if len(coords) > 0:
         sam_output = sam_model(image, points=coords, labels=np.ones(len(coords)), verbose=False)
         if sam_output[0].masks:
@@ -125,58 +128,142 @@ def get_mask(image, coords):
                     contour = max(contours, key=cv2.contourArea)
                     x, y, w, h = cv2.boundingRect(contour)
                     bboxes.append([x, y, w, h])
+                    masks.append(pred_mask[i].tolist())
                 else:
                     bboxes.append(None)
-    return bboxes
+                    masks.append(None)
+    return bboxes, masks
+
+
+def _draw_overlays(
+    base_img_bgr,
+    points_xy,
+    bboxes_xywh,
+    masks=None,
+    y_offset: int = 0,
+    point_color = (0, 255, 255),    # BGR (yellow)
+    box_color = (0, 140, 255),      # BGR (orange)
+    mask_color = (0, 255, 0),       # BGR (green)
+    point_radius: int = 6,
+    box_thickness: int = 2,
+    mask_alpha: float = 0.3,
+    font_scale: float = 0.5,
+    font_thickness: int = 1,
+) -> np.ndarray:
+    """Draw SAM masks, Molmo points and SAM boxes on a copy of the input image."""
+    overlay = base_img_bgr.copy()
+
+    # Draw masks
+    if masks is not None:
+        for j, mask in enumerate(masks):
+            if mask is not None:
+                mask_array = np.array(mask, dtype=np.uint8) * 255
+                mask_colored = cv2.cvtColor(mask_array, cv2.COLOR_GRAY2BGR)
+                mask_colored[:,:] = mask_color
+                # Apply mask only where mask_array is > 0
+                mask_region = mask_array > 0
+                overlay[mask_region] = cv2.addWeighted(overlay[mask_region], 1 - mask_alpha, mask_colored[mask_region], mask_alpha, 0)
+            break 
+
+
+    # Draw Molmo points
+    if points_xy is not None and len(points_xy) > 0:
+        for point in points_xy:
+            x, y = int(point[0]), int(point[1])
+            cv2.circle(overlay, (x, y), point_radius, (255, 0, 0), -1, lineType=cv2.LINE_AA)  # Blue for Molmo points
+            cv2.putText(
+                overlay, "Molmo Point",
+                (x + 10, y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 0, 0), font_thickness, cv2.LINE_AA
+            )
+            break 
+
+
+    # Draw boxes and midpoints
+    for j, (bx, by, bw, bh) in enumerate(bboxes_xywh):
+        yy = by + y_offset
+        mid_x = bx + bw // 2
+        mid_y = by + bh // 2 + y_offset
+        cv2.circle(overlay, (mid_x, mid_y), point_radius, point_color, -1, lineType=cv2.LINE_AA)
+        cv2.putText(
+            overlay, "Midpoint",
+            (mid_x + 10, mid_y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale, point_color, font_thickness, cv2.LINE_AA
+        )
+        cv2.rectangle(overlay, (bx, yy), (bx + bw, yy + bh), box_color, box_thickness)
+        cv2.putText(
+            overlay, f"box {j+1}",
+            (bx, max(0, yy - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale, box_color, font_thickness, cv2.LINE_AA
+        )
+        break 
+
+    return overlay
 
 
 def detect(image_path, prompt):
+    '''
+    Main detection function that processes the image and prompt to return bounding boxes.
+    1) Load image
+    '''
     cv_img = cv2.imread(image_path)
-    # cropped_cv_image, y_offset = crop_panorama(cv_img)
-    cropped_cv_image = cv_img
-    y_offset = 0
-    cropped_cv_image_rgb = cv2.cvtColor(cropped_cv_image, cv2.COLOR_BGR2RGB)
-    height, width = cropped_cv_image_rgb.shape[:2]
+    cv_image_rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+    height, width = cv_image_rgb.shape[:2]
 
-    cropped_pil_image_rgb = Image.fromarray(cropped_cv_image_rgb)
-    molmo_out = generate_point(cropped_pil_image_rgb, prompt)
+    pil_image_rgb = Image.fromarray(cv_image_rgb)
+    molmo_out = generate_point(pil_image_rgb, prompt)
     obj_coord = parse_coord(molmo_out, height, width)
 
-    if not len(obj_coord): ### TODO: check here if fails
+    print(f"Molmo output: {molmo_out}")
+    print(f"Parsed object coordinates: {obj_coord}")
+    if not len(obj_coord):
         raise ValueError("No object coordinates found")
 
-    sam_out = get_mask(cropped_pil_image_rgb, obj_coord)
+    sam_bbs, sam_masks = get_mask(pil_image_rgb, obj_coord)
 
     # Adjust bounding boxes by adding the y_offset to y coordinates (like in draw_bbox)
     adjusted_bboxes = []
-    for bbox in sam_out:
+    adjusted_masks = []
+    for bbox, mask in zip(sam_bbs, sam_masks):
         if bbox:
             x, y, w, h = bbox
             # Adjust the y-coordinate
-            adjusted_bboxes.append([x, y + y_offset, w, h])
+            adjusted_bboxes.append([x, y, w, h])
+            adjusted_masks.append(mask)
 
-    return adjusted_bboxes
+    annotated = _draw_overlays(cv_img, obj_coord, adjusted_bboxes, masks=adjusted_masks, y_offset=0)
+
+    # 5) Optionally save
+    save_annotated_to = "data/annotated_output.jpg"
+    if save_annotated_to:
+        ok = cv2.imwrite(save_annotated_to, annotated)
+        if not ok:
+            raise IOError(f"Failed to write annotated image to: {save_annotated_to}")
+
+    return adjusted_bboxes, adjusted_masks
 
 # Flask route to handle object detection
 @app.route('/detect', methods=['POST'])
 def detect_objects():
-    if 'file' not in request.files or 'prompt' not in request.form:
-        return jsonify({"error": "Image file and prompt are required"}), 400
+    if 'image' not in request.files or 'prompt' not in request.form or 'depth' not in request.files:
+        return jsonify({"error": "Image file, prompt and depth map are required"}), 400
 
-    file = request.files['file']
+    # * Getting inputs
+    file = request.files['image']
     depth_map = request.files['depth']
     prompt = request.form['prompt']
     
-    temp_image_path = "/tmp/temp_image.jpg"
-    temp_depth_path = "/tmp/temp_depth.png"
+
+    # * Save the uploaded files temporarily
+    temp_image_path = "data/temp_image.jpg"
+    temp_depth_path = "data/temp_depth.png"
 
     file.save(temp_image_path)
     depth_map.save(temp_depth_path)
-    depth_map = cv2.imread(temp_depth_path)
-    
+
     try:
-        bounding_boxes = detect(temp_image_path, prompt)
-        print(f"Detected bounding boxes: {bounding_boxes}, {depth_map.shape}")
+        bounding_boxes, masks = detect(temp_image_path, prompt)
+        print(f"Detected bounding boxes: {bounding_boxes}")
         distance = distance_to_detected_center(bounding_boxes[0], cv2.imread(temp_depth_path, cv2.IMREAD_UNCHANGED))
     except ValueError as e:
         return jsonify({"error": str(e)}), 500
@@ -191,39 +278,6 @@ def detect_objects():
 
 
 
-def get_prompt(image_path, prompt):
-    cv_img = cv2.imread(image_path)
-    cropped_cv_image, y_offset = crop_panorama(cv_img)
-    cropped_cv_image_rgb = cv2.cvtColor(cropped_cv_image, cv2.COLOR_BGR2RGB)
-    height, width = cropped_cv_image_rgb.shape[:2]
-
-    cropped_pil_image_rgb = Image.fromarray(cropped_cv_image_rgb)
-    molmo_out = generate_vlm_request(cropped_pil_image_rgb, prompt)
-    return molmo_out
-
-# Flask route to handle object detection
-@app.route('/prompt_vlm', methods=['POST'])
-def prompt_vlm():
-    if 'file' not in request.files or 'prompt' not in request.form:
-        return jsonify({"error": "Image file and prompt are required"}), 400
-
-    file = request.files['file']
-    prompt = request.form['prompt']
-    
-    print(f"prompt: {prompt}")
-    temp_image_path = "/tmp/temp_image.jpg"
-    file.save(temp_image_path)
-    
-    try:
-        response = get_prompt(temp_image_path, prompt)
-        print("Response:", response)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 500
-
-    os.remove(temp_image_path)
-    
-    return jsonify({"response": response})
-
-
 if __name__ == '__main__':
+    DEBUG = True # Set to False in production
     app.run(host='0.0.0.0', port=5007)
